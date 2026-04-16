@@ -74,6 +74,7 @@ fn make_manifest(boundary_count: usize) -> ContractManifest {
         },
         agents,
         boundaries,
+        shadow_tier: None,
     }
 }
 

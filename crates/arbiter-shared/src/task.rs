@@ -50,3 +50,19 @@ pub struct EgressLogEntry {
     /// Byte length of the raw response.
     pub size_bytes: usize,
 }
+
+/// Shadow-tier classification result logged by the async SetFit evaluator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowLogEntry {
+    pub timestamp: DateTime<Utc>,
+    /// The task ID that triggered the shadow evaluation.
+    pub task_id: String,
+    /// Label returned by the classifier ("safe" or a boundary category).
+    pub label: String,
+    /// Confidence score from the classifier (0.0–1.0).
+    pub confidence: f64,
+    /// Whether the classifier would have refused this request.
+    pub would_refuse: bool,
+    /// Classifier latency in milliseconds.
+    pub latency_ms: f64,
+}

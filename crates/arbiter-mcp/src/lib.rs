@@ -284,6 +284,7 @@ mod tests {
                 compiled_at: Utc::now(),
                 active: true,
             }],
+            shadow_tier: None,
         };
 
         let log_path = dir.join("mcp_audit.jsonl");

@@ -1,4 +1,5 @@
 pub mod policy;
+pub mod shadow;
 
 use anyhow::{Context, Result};
 use arbiter_audit::AuditChain;
@@ -7,6 +8,7 @@ use arbiter_shared::contract::ContractManifest;
 use arbiter_shared::task::{DecisionLogEntry, Task, TaskStatus};
 use policy::{PolicyEngine, PolicyVerdict};
 use sha2::{Digest, Sha256};
+use shadow::ShadowClient;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -31,6 +33,7 @@ pub struct Engine {
     manifest: ContractManifest,
     policy_engine: Arc<PolicyEngine>,
     audit: Arc<Mutex<AuditChain>>,
+    shadow: Option<Arc<ShadowClient>>,
 }
 
 impl Engine {
@@ -97,6 +100,16 @@ impl Engine {
         let policy_engine = PolicyEngine::from_boundaries(manifest.boundaries.clone());
         let audit = AuditChain::open(audit_path).await?;
 
+        let shadow = manifest
+            .shadow_tier
+            .as_ref()
+            .filter(|c| c.enabled)
+            .map(|c| Arc::new(ShadowClient::new(c.clone())));
+
+        if shadow.is_some() {
+            tracing::info!("shadow tier enabled");
+        }
+
         tracing::info!(
             boundaries = policy_engine.active_count(),
             agents = manifest.agents.len(),
@@ -107,6 +120,7 @@ impl Engine {
             manifest,
             policy_engine: Arc::new(policy_engine),
             audit: Arc::new(Mutex::new(audit)),
+            shadow,
         })
     }
 
@@ -145,6 +159,26 @@ impl Engine {
                     outcome: None,
                 };
                 self.audit.lock().await.append(&entry).await?;
+
+                // Spawn async shadow evaluation (fire-and-forget, never blocks).
+                if let Some(shadow) = &self.shadow {
+                    let shadow = Arc::clone(shadow);
+                    let audit = Arc::clone(&self.audit);
+                    let task_id = task.id.clone();
+                    let text = format!("{} {}", task.task_type, task.payload);
+                    tokio::spawn(async move {
+                        match shadow.classify(&task_id, &text).await {
+                            Ok(entry) => {
+                                if let Err(e) = audit.lock().await.append(&entry).await {
+                                    tracing::warn!("shadow audit write failed: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(task_id = %task_id, "shadow classify failed: {e}");
+                            }
+                        }
+                    });
+                }
 
                 tracing::info!(agent = %agent_id, "task allowed and routed");
 
@@ -199,6 +233,11 @@ impl Engine {
 
     pub fn policy_engine(&self) -> &PolicyEngine {
         &self.policy_engine
+    }
+
+    /// Whether the shadow tier is configured and enabled.
+    pub fn shadow_enabled(&self) -> bool {
+        self.shadow.is_some()
     }
 
     /// Access the audit chain (requires async lock).
@@ -257,6 +296,7 @@ mod tests {
                 compiled_at: Utc::now(),
                 active: true,
             }],
+            shadow_tier: None,
         }
     }
 

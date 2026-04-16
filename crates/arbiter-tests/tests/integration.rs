@@ -7,7 +7,7 @@ use arbiter_engine::Engine;
 use arbiter_mcp::firewall::{evaluate_message, log_response, EvaluateResult};
 use arbiter_mcp::Interceptor;
 use arbiter_shared::boundary::{BoundaryCategory, PolicyBoundary};
-use arbiter_shared::contract::{AgentContract, ContractManifest, GlobalContract};
+use arbiter_shared::contract::{AgentContract, ContractManifest, GlobalContract, ShadowConfig};
 use arbiter_shared::task::{DecisionLogEntry, Task};
 use chrono::Utc;
 use std::collections::HashMap;
@@ -41,6 +41,7 @@ fn test_manifest() -> ContractManifest {
             compiled_at: Utc::now(),
             active: true,
         }],
+        shadow_tier: None,
     }
 }
 
@@ -492,4 +493,168 @@ async fn egress_response_is_audited() {
     );
     assert_eq!(egress["size_bytes"], server_response.len());
     assert_eq!(egress["request_id"], 50);
+}
+
+/// M2.2: Shadow evaluation — an allowed request triggers an async shadow
+/// classify call to the SetFit service, and the result is logged to the
+/// audit chain without blocking the request path.
+#[tokio::test]
+async fn shadow_evaluation_logs_classify_result() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // 1. Spin up a tiny mock classifier HTTP server
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let mock_server = tokio::spawn(async move {
+        // Handle up to 5 requests then stop
+        for _ in 0..5 {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+
+            let body = r#"{"label":"safe","confidence":0.92}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    // 2. Boot engine with shadow tier enabled
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("shadow_audit.jsonl");
+
+    let mut manifest = test_manifest();
+    manifest.shadow_tier = Some(ShadowConfig {
+        enabled: true,
+        endpoint: format!("http://127.0.0.1:{port}/classify"),
+        confidence_threshold: 0.7,
+    });
+
+    let engine = Engine::boot_from_manifest(manifest, &log_path)
+        .await
+        .unwrap();
+
+    assert!(engine.shadow_enabled(), "shadow tier should be enabled");
+
+    // 3. Evaluate a benign task — should be allowed, shadow eval spawned
+    let task = Task {
+        id: "shadow-test-1".into(),
+        task_type: "summarise".into(),
+        payload: serde_json::json!({"text": "quarterly report"}),
+        submitted_at: Utc::now(),
+    };
+
+    let result = engine.evaluate(&task).await.unwrap();
+    assert!(matches!(result, arbiter_engine::EvalResult::Allow { .. }));
+
+    // 4. Wait briefly for the spawned shadow task to complete
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // 5. Check the audit log for a shadow entry
+    let raw = tokio::fs::read_to_string(&log_path).await.unwrap();
+    let lines: Vec<&str> = raw.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "should have 1 decision + 1 shadow entry");
+
+    let shadow_entry: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(shadow_entry["task_id"], "shadow-test-1");
+    assert_eq!(shadow_entry["label"], "safe");
+    assert_eq!(shadow_entry["confidence"], 0.92);
+    assert_eq!(shadow_entry["would_refuse"], false);
+
+    // 6. Audit chain must still be valid
+    assert!(
+        AuditChain::verify(&log_path).await.unwrap(),
+        "audit chain must be valid after shadow evaluation"
+    );
+
+    mock_server.abort();
+}
+
+/// M2.2: Shadow would-refuse — the classifier flags a request that the
+/// deterministic policy engine allowed. The request is NOT blocked, but
+/// a ShadowLogEntry with would_refuse=true is written to the audit chain.
+#[tokio::test]
+async fn shadow_would_refuse_is_logged() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // Mock classifier returns "unsafe" with high confidence
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let mock_server = tokio::spawn(async move {
+        for _ in 0..5 {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+
+            let body = r#"{"label":"privacy_violation","confidence":0.88}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("shadow_refuse_audit.jsonl");
+
+    let mut manifest = test_manifest();
+    manifest.shadow_tier = Some(ShadowConfig {
+        enabled: true,
+        endpoint: format!("http://127.0.0.1:{port}/classify"),
+        confidence_threshold: 0.7,
+    });
+
+    let engine = Engine::boot_from_manifest(manifest, &log_path)
+        .await
+        .unwrap();
+
+    // This task is benign to the deterministic engine, but the shadow
+    // classifier will flag it as a privacy violation.
+    let task = Task {
+        id: "shadow-refuse-1".into(),
+        task_type: "summarise".into(),
+        payload: serde_json::json!({"text": "quarterly report"}),
+        submitted_at: Utc::now(),
+    };
+
+    let result = engine.evaluate(&task).await.unwrap();
+    assert!(
+        matches!(result, arbiter_engine::EvalResult::Allow { .. }),
+        "deterministic engine must still allow the request"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let raw = tokio::fs::read_to_string(&log_path).await.unwrap();
+    let lines: Vec<&str> = raw.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "should have 1 decision + 1 shadow entry");
+
+    let shadow_entry: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(shadow_entry["task_id"], "shadow-refuse-1");
+    assert_eq!(shadow_entry["label"], "privacy_violation");
+    assert_eq!(shadow_entry["would_refuse"], true);
+
+    assert!(
+        AuditChain::verify(&log_path).await.unwrap(),
+        "audit chain must be valid"
+    );
+
+    mock_server.abort();
 }
