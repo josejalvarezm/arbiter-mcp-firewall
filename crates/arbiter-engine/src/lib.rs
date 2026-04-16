@@ -6,6 +6,7 @@ use arbiter_shared::boundary::{PolicyBoundary, RefusalRecord};
 use arbiter_shared::contract::ContractManifest;
 use arbiter_shared::task::{DecisionLogEntry, Task, TaskStatus};
 use policy::{PolicyEngine, PolicyVerdict};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use tracing::instrument;
 
@@ -28,6 +29,10 @@ pub struct Engine {
 
 impl Engine {
     /// Boot the engine from a manifest JSON file and an audit log path.
+    ///
+    /// If `expected_hash` is `Some`, the SHA-256 of the raw manifest file
+    /// content is compared against it. A mismatch is a fatal boot error
+    /// (manifest tampering detected).
     #[instrument(skip_all, fields(manifest = %manifest_path.as_ref().display()))]
     pub async fn boot(
         manifest_path: impl AsRef<Path>,
@@ -40,6 +45,42 @@ impl Engine {
             serde_json::from_str(&data).context("parsing contract manifest")?;
 
         Self::boot_from_manifest(manifest, audit_path).await
+    }
+
+    /// Boot from a manifest file with an integrity check.
+    ///
+    /// Computes the SHA-256 of the raw manifest and compares it against
+    /// `expected_hash`. Returns an error if the hashes do not match.
+    #[instrument(skip_all, fields(manifest = %manifest_path.as_ref().display()))]
+    pub async fn boot_verified(
+        manifest_path: impl AsRef<Path>,
+        audit_path: impl AsRef<Path>,
+        expected_hash: &str,
+    ) -> Result<Self> {
+        let data = tokio::fs::read_to_string(manifest_path.as_ref())
+            .await
+            .context("reading contract manifest")?;
+
+        let actual_hash = compute_sha256(&data);
+        if actual_hash != expected_hash {
+            anyhow::bail!(
+                "manifest integrity check failed: expected {expected_hash}, got {actual_hash}"
+            );
+        }
+
+        tracing::info!("manifest integrity check passed");
+
+        let manifest: ContractManifest =
+            serde_json::from_str(&data).context("parsing contract manifest")?;
+
+        Self::boot_from_manifest(manifest, audit_path).await
+    }
+
+    /// Compute the SHA-256 hash of a manifest JSON string.
+    ///
+    /// Useful for generating the expected hash at build/deploy time.
+    pub fn manifest_hash(manifest_json: &str) -> String {
+        compute_sha256(manifest_json)
     }
 
     /// Boot from an in-memory manifest (useful for testing).
@@ -175,6 +216,13 @@ impl Engine {
     }
 }
 
+/// Compute the SHA-256 hex digest of a string.
+fn compute_sha256(data: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +327,60 @@ mod tests {
         engine.evaluate(&task).await.unwrap();
 
         assert!(AuditChain::verify(&log_path).await.unwrap());
+    }
+
+    // --- M0.4 acceptance tests: manifest integrity check ---
+
+    #[tokio::test]
+    async fn boot_verified_succeeds_with_correct_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        let log_path = dir.path().join("test.jsonl");
+
+        let manifest_json = serde_json::to_string_pretty(&test_manifest()).unwrap();
+        let expected_hash = Engine::manifest_hash(&manifest_json);
+        tokio::fs::write(&manifest_path, &manifest_json).await.unwrap();
+
+        let engine = Engine::boot_verified(&manifest_path, &log_path, &expected_hash).await;
+        assert!(engine.is_ok(), "boot_verified must succeed with correct hash");
+    }
+
+    #[tokio::test]
+    async fn boot_verified_fails_with_wrong_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        let log_path = dir.path().join("test.jsonl");
+
+        let manifest_json = serde_json::to_string_pretty(&test_manifest()).unwrap();
+        tokio::fs::write(&manifest_path, &manifest_json).await.unwrap();
+
+        let wrong_hash = "deadbeef".repeat(8); // 64-char bogus hash
+        let result = Engine::boot_verified(&manifest_path, &log_path, &wrong_hash).await;
+        assert!(result.is_err(), "boot_verified must fail with wrong hash");
+
+        let err_msg = format!("{}", result.err().unwrap());
+        assert!(
+            err_msg.contains("manifest integrity check failed"),
+            "error must mention integrity check, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_verified_detects_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        let log_path = dir.path().join("test.jsonl");
+
+        // Write original manifest and record its hash
+        let manifest_json = serde_json::to_string_pretty(&test_manifest()).unwrap();
+        let expected_hash = Engine::manifest_hash(&manifest_json);
+        tokio::fs::write(&manifest_path, &manifest_json).await.unwrap();
+
+        // Tamper with the file (change version)
+        let tampered = manifest_json.replace("\"1\"", "\"999\"");
+        tokio::fs::write(&manifest_path, &tampered).await.unwrap();
+
+        let result = Engine::boot_verified(&manifest_path, &log_path, &expected_hash).await;
+        assert!(result.is_err(), "tampered manifest must fail integrity check");
     }
 }

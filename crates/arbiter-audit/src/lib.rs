@@ -4,14 +4,17 @@
 //! carries the previous hash, forming a chain. Modifying or deleting
 //! any entry breaks the chain from that point forward.
 //!
+//! The file handle is opened once and held for the lifetime of the
+//! `AuditChain`. Writes are flushed after every append.
+//!
 //! All I/O is async via Tokio.
 
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use tokio::fs::{self, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::instrument;
 
 /// SHA-256 genesis hash: 64 hex zeros.
@@ -37,10 +40,13 @@ pub struct ChainedEntry<T> {
 /// Async, append-only, hash-chained audit log.
 ///
 /// Generic over `T`: any type implementing `Serialize + DeserializeOwned`.
+/// The file handle is opened once and held for the lifetime of the chain.
 pub struct AuditChain {
     path: PathBuf,
     /// SHA-256 of the last written JSON line (chain head).
     last_hash: String,
+    /// Persistent buffered writer — avoids reopening the file on every append.
+    writer: BufWriter<File>,
 }
 
 impl AuditChain {
@@ -55,8 +61,7 @@ impl AuditChain {
                 .context("creating audit log directory")?;
         }
 
-        // Create the file if it doesn't exist
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
@@ -67,7 +72,11 @@ impl AuditChain {
 
         tracing::debug!(last_hash = %last_hash, "audit chain opened");
 
-        Ok(AuditChain { path, last_hash })
+        Ok(AuditChain {
+            path,
+            last_hash,
+            writer: BufWriter::new(file),
+        })
     }
 
     /// Append an entry to the log with hash-chaining.
@@ -85,17 +94,15 @@ impl AuditChain {
 
         line.push('\n');
 
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&self.path)
-            .await
-            .context("opening audit log for append")?;
-
-        file.write_all(line.as_bytes())
+        self.writer
+            .write_all(line.as_bytes())
             .await
             .context("writing audit entry")?;
 
-        file.flush().await.context("flushing audit log")?;
+        self.writer
+            .flush()
+            .await
+            .context("flushing audit log")?;
 
         tracing::trace!(hash = %self.last_hash, "entry appended");
 

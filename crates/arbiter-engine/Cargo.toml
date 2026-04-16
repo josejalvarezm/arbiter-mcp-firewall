@@ -9,6 +9,7 @@ arbiter-audit = { path = "../arbiter-audit" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+sha2 = { workspace = true }
 unicode-normalization = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
