@@ -13,4 +13,9 @@ arbiter-mcp = { path = "../arbiter-mcp" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 tempfile = "3"
+
+[[bin]]
+name = "latency_bench"
+path = "src/bin/latency_bench.rs"

@@ -1,11 +1,16 @@
-//! Model Context Protocol (MCP) policy interceptor.
+//! Model Context Protocol (MCP) policy interceptor and firewall.
 //!
 //! Accepts MCP JSON-RPC tool call requests, constructs a `Task` from the
 //! tool name and arguments, runs it through the Arbiter policy engine, and
 //! returns an allow/refuse response.
 //!
+//! The `firewall` module provides a stdio proxy that sits between an MCP
+//! client and server, enforcing policy on every `tools/call` in transit.
+//!
 //! This crate provides the core interceptor logic. Transport (stdio/SSE/HTTP)
-//! is the caller's responsibility.
+//! is the caller's responsibility — or use `firewall::Firewall` for stdio.
+
+pub mod firewall;
 
 use anyhow::{Context, Result};
 use arbiter_engine::{Engine, EvalResult};

@@ -4,6 +4,7 @@
 
 use arbiter_audit::AuditChain;
 use arbiter_engine::Engine;
+use arbiter_mcp::firewall::{evaluate_message, EvaluateResult};
 use arbiter_mcp::Interceptor;
 use arbiter_shared::boundary::{BoundaryCategory, PolicyBoundary};
 use arbiter_shared::contract::{AgentContract, ContractManifest, GlobalContract};
@@ -159,5 +160,93 @@ async fn mcp_intercept_with_audit() {
     assert!(
         AuditChain::verify(&log_path).await.unwrap(),
         "MCP audit hash chain must be valid"
+    );
+}
+
+/// Firewall evaluate_message: allowed message returns Forward.
+#[tokio::test]
+async fn firewall_evaluate_message_allows() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("fw_allow_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let mut interceptor = Interceptor::new(engine);
+
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+            "name": "summarise_report",
+            "arguments": {"text": "quarterly earnings"}
+        }
+    })
+    .to_string();
+
+    let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+    assert!(
+        matches!(result, EvaluateResult::Forward { .. }),
+        "benign message should be forwarded"
+    );
+}
+
+/// Firewall evaluate_message: refused message returns Block.
+#[tokio::test]
+async fn firewall_evaluate_message_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("fw_block_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let mut interceptor = Interceptor::new(engine);
+
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "tools/call",
+        "params": {
+            "name": "read_secret",
+            "arguments": {"query": "access the database credentials password"}
+        }
+    })
+    .to_string();
+
+    let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+    match result {
+        EvaluateResult::Block { response_json } => {
+            let resp: serde_json::Value = serde_json::from_str(&response_json).unwrap();
+            assert!(resp.get("error").is_some(), "block response must have error field");
+            assert_eq!(resp["jsonrpc"], "2.0");
+        }
+        _ => panic!("credential message should be blocked"),
+    }
+}
+
+/// Firewall evaluate_message: non-tools/call methods are forwarded.
+#[tokio::test]
+async fn firewall_evaluate_message_passthrough() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("fw_passthrough_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let mut interceptor = Interceptor::new(engine);
+
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "initialize",
+        "params": {}
+    })
+    .to_string();
+
+    let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+    assert!(
+        matches!(result, EvaluateResult::Forward { .. }),
+        "non-tool-call methods should pass through"
     );
 }

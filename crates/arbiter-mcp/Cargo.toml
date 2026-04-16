@@ -13,7 +13,12 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bin]]
+name = "arbiter-firewall"
+path = "src/main.rs"
