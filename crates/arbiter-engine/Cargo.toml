@@ -1,0 +1,18 @@
+[package]
+name = "arbiter-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arbiter-shared = { path = "../arbiter-shared" }
+arbiter-audit = { path = "../arbiter-audit" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+unicode-normalization = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

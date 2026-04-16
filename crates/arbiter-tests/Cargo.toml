@@ -1,0 +1,16 @@
+[package]
+name = "arbiter-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+arbiter-shared = { path = "../arbiter-shared" }
+arbiter-audit = { path = "../arbiter-audit" }
+arbiter-engine = { path = "../arbiter-engine" }
+arbiter-runtime = { path = "../arbiter-runtime" }
+arbiter-mcp = { path = "../arbiter-mcp" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tempfile = "3"
