@@ -10,6 +10,7 @@
 //! This crate provides the core interceptor logic. Transport (stdio/SSE/HTTP)
 //! is the caller's responsibility — or use `firewall::Firewall` for stdio.
 
+pub mod compliance;
 pub mod firewall;
 pub mod http;
 
@@ -17,6 +18,7 @@ use anyhow::{Context, Result};
 use arbiter_engine::{Engine, EvalResult};
 use arbiter_shared::task::{EgressLogEntry, Task};
 use chrono::Utc;
+use compliance::ToolRegistry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::instrument;
@@ -94,11 +96,20 @@ fn is_passthrough_method(method: &str) -> bool {
 #[derive(Clone)]
 pub struct Interceptor {
     engine: Engine,
+    tool_registry: ToolRegistry,
 }
 
 impl Interceptor {
     pub fn new(engine: Engine) -> Self {
-        Interceptor { engine }
+        Interceptor {
+            engine,
+            tool_registry: ToolRegistry::new(),
+        }
+    }
+
+    /// Return a reference to the tool registry for tool metadata inspection.
+    pub fn tool_registry(&self) -> &ToolRegistry {
+        &self.tool_registry
     }
 
     /// Process a raw JSON-RPC request string.
@@ -119,6 +130,8 @@ impl Interceptor {
     /// - **Passthrough allowlist** (`ping`, `initialize`, `initialized`,
     ///   `notifications/*`): forwarded without policy evaluation.
     /// - **`tools/call`**: tool name + arguments are extracted and evaluated.
+    ///   Destructive tools must be in the manifest allowlist.
+    /// - **`elicitation/create`**: checked against blocked data types.
     /// - **Everything else** (`resources/read`, `sampling/createMessage`,
     ///   `prompts/get`, etc.): the method name becomes the `task_type` and
     ///   the params become the payload — routed through full policy evaluation.
@@ -135,13 +148,67 @@ impl Interceptor {
             });
         }
 
-        // 2. tools/call: extract tool name + arguments.
+        // 2. elicitation/create: check against blocked types.
+        if request.method == "elicitation/create" {
+            let manifest = self.engine.manifest();
+            let entry = compliance::check_elicitation(
+                &request.params,
+                &manifest.blocked_elicitation_types,
+            );
+            // Log the elicitation event
+            self.engine.audit().await.append(&entry).await?;
+
+            if !entry.allowed {
+                let response = JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id.clone(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32600,
+                        message: format!("Elicitation blocked: {}", entry.reason),
+                        data: None,
+                    }),
+                };
+                return Ok(InterceptResult::Refuse(response));
+            }
+
+            let tool_call = ToolCall {
+                name: request.method.clone(),
+                arguments: request.params.clone(),
+            };
+            return Ok(InterceptResult::Allow {
+                tool_call,
+                agent_id: "elicitation".to_string(),
+            });
+        }
+
+        // 3. tools/call: extract tool name + arguments.
         if request.method == "tools/call" {
             let tool_call = extract_tool_call(&request.params)?;
+
+            // M4.1: Enforce destructive tool policy
+            let is_destructive = self.tool_registry.is_destructive(&tool_call.name).await;
+            let manifest = self.engine.manifest();
+            if let Err(reason) =
+                compliance::check_destructive_policy(&tool_call.name, is_destructive, &manifest.destructive_allowlist)
+            {
+                let response = JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id.clone(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32600,
+                        message: format!("Policy violation: {reason}"),
+                        data: None,
+                    }),
+                };
+                return Ok(InterceptResult::Refuse(response));
+            }
+
             return self.evaluate_tool_call(tool_call, request).await;
         }
 
-        // 3. Default-deny: route all other methods through policy evaluation.
+        // 4. Default-deny: route all other methods through policy evaluation.
         //    The method name becomes the task_type; params become the payload.
         let tool_call = ToolCall {
             name: request.method.clone(),
@@ -205,22 +272,88 @@ impl Interceptor {
     ///
     /// Records a SHA-256 content hash, the JSON-RPC request ID (if present),
     /// and the response size. Does not block or modify the response.
+    ///
+    /// Also performs M4 compliance checks:
+    /// - Multi-modal content extraction and size enforcement
+    /// - Output schema validation (if tool has declared schema)
     pub async fn log_egress(&self, raw_response: &str) -> Result<()> {
         let content_hash = format!(
             "{:x}",
             Sha256::new().chain_update(raw_response.as_bytes()).finalize()
         );
-        let request_id = serde_json::from_str::<serde_json::Value>(raw_response)
-            .ok()
-            .and_then(|v| v.get("id").cloned());
+        let parsed = serde_json::from_str::<serde_json::Value>(raw_response).ok();
+        let request_id = parsed.as_ref().and_then(|v| v.get("id").cloned());
 
         let entry = EgressLogEntry {
             timestamp: Utc::now(),
             content_hash,
-            request_id,
+            request_id: request_id.clone(),
             size_bytes: raw_response.len(),
         };
-        self.engine.audit().await.append(&entry).await
+        self.engine.audit().await.append(&entry).await?;
+
+        // M4.3: Multi-modal content logging
+        if let Some(ref resp) = parsed {
+            let manifest = self.engine.manifest();
+            match compliance::extract_content_blocks(resp, manifest.max_binary_size) {
+                Ok((blocks, total_size)) if !blocks.is_empty() => {
+                    let mm_entry = compliance::build_multimodal_entry(
+                        request_id.clone(),
+                        blocks,
+                        total_size,
+                    );
+                    self.engine.audit().await.append(&mm_entry).await?;
+                }
+                Err(reason) => {
+                    tracing::warn!("multi-modal content rejected: {reason}");
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Ingest a `tools/list` response to populate the tool registry.
+    ///
+    /// Call this when a `tools/list` response passes through the proxy
+    /// to register tool annotations and output schemas for M4 compliance.
+    pub async fn ingest_tools_list(&self, raw_response: &str) -> Result<()> {
+        let response: serde_json::Value =
+            serde_json::from_str(raw_response).context("parsing tools/list response")?;
+        self.tool_registry.ingest_tools_list(&response).await
+    }
+
+    /// Validate a tool response against its declared output schema (M4.2).
+    ///
+    /// Returns any schema violations found. Logs violations to the audit chain.
+    pub async fn validate_tool_response(
+        &self,
+        tool_name: &str,
+        raw_response: &str,
+    ) -> Result<Vec<String>> {
+        let schema = match self.tool_registry.output_schema(tool_name).await {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        };
+
+        let response: serde_json::Value =
+            serde_json::from_str(raw_response).context("parsing tool response")?;
+
+        let result_value = response
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        let violations = compliance::validate_output_schema(&result_value, &schema);
+
+        if !violations.is_empty() {
+            let request_id = response.get("id").cloned();
+            let entry = compliance::build_schema_violation(tool_name, request_id, &violations);
+            self.engine.audit().await.append(&entry).await?;
+        }
+
+        Ok(violations)
     }
 }
 
@@ -287,6 +420,10 @@ mod tests {
                 active: true,
             }],
             shadow_tier: None,
+            destructive_allowlist: vec![],
+            max_binary_size: 10 * 1024 * 1024,
+            blocked_elicitation_types: vec!["password".into(), "secret".into(), "credential".into()],
+            audit_max_file_size: 50 * 1024 * 1024,
         };
 
         let log_path = dir.join("mcp_audit.jsonl");

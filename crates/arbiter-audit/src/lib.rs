@@ -47,6 +47,10 @@ pub struct AuditChain {
     last_hash: String,
     /// Persistent buffered writer — avoids reopening the file on every append.
     writer: BufWriter<File>,
+    /// Running byte count of the current file.
+    current_size: u64,
+    /// Number of rotated files so far.
+    rotation_index: u32,
 }
 
 impl AuditChain {
@@ -68,6 +72,7 @@ impl AuditChain {
             .await
             .context("opening audit log file")?;
 
+        let current_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
         let last_hash = recover_last_hash(&path).await?;
 
         tracing::debug!(last_hash = %last_hash, "audit chain opened");
@@ -76,6 +81,8 @@ impl AuditChain {
             path,
             last_hash,
             writer: BufWriter::new(file),
+            current_size,
+            rotation_index: 0,
         })
     }
 
@@ -94,6 +101,7 @@ impl AuditChain {
 
         line.push('\n');
 
+        let line_bytes = line.len() as u64;
         self.writer
             .write_all(line.as_bytes())
             .await
@@ -104,9 +112,58 @@ impl AuditChain {
             .await
             .context("flushing audit log")?;
 
+        self.current_size += line_bytes;
+
         tracing::trace!(hash = %self.last_hash, "entry appended");
 
         Ok(())
+    }
+
+    /// Rotate the log file if it exceeds `max_size` bytes.
+    ///
+    /// The rotated file is renamed to `<path>.1`, `.2`, etc.
+    /// A new file is created and the chain continues (with the current
+    /// `last_hash` carried over for cross-file continuity).
+    pub async fn rotate_if_needed(&mut self, max_size: usize) -> Result<bool> {
+        if max_size == 0 || (self.current_size as usize) < max_size {
+            return Ok(false);
+        }
+
+        // Flush and drop the current writer
+        self.writer.flush().await.context("flushing before rotation")?;
+
+        self.rotation_index += 1;
+        let rotated_path = format!("{}.{}", self.path.display(), self.rotation_index);
+
+        // Rename current → rotated
+        fs::rename(&self.path, &rotated_path)
+            .await
+            .context("renaming audit log for rotation")?;
+
+        tracing::info!(
+            rotated_to = %rotated_path,
+            size = self.current_size,
+            "audit log rotated"
+        );
+
+        // Open a fresh file
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+            .context("opening new audit log after rotation")?;
+
+        self.writer = BufWriter::new(file);
+        self.current_size = 0;
+        // last_hash carries over — cross-file chain continuity
+
+        Ok(true)
+    }
+
+    /// Return the current file size in bytes.
+    pub fn current_size(&self) -> u64 {
+        self.current_size
     }
 
     /// Read all entries from the log.
@@ -173,6 +230,74 @@ impl AuditChain {
     /// Return the log file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Query audit log entries as raw JSON, filtered by a predicate.
+    ///
+    /// The predicate receives each raw JSON `Value` and returns `true` to include it.
+    /// Useful for searching by session, time range, or decision type without
+    /// requiring a concrete deserialization target.
+    pub async fn query(
+        &self,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+    ) -> Result<Vec<serde_json::Value>> {
+        let content = fs::read_to_string(&self.path)
+            .await
+            .context("reading audit log for query")?;
+
+        let mut results = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                if predicate(&val) {
+                    results.push(val);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Query by time range (inclusive). Both bounds are optional.
+    pub async fn query_by_time_range(
+        &self,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.query(|val| {
+            let ts = val
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc));
+            match ts {
+                Some(dt) => {
+                    let after = from.is_none_or(|f| dt >= f);
+                    let before = to.is_none_or(|t| dt <= t);
+                    after && before
+                }
+                None => false,
+            }
+        })
+        .await
+    }
+
+    /// List all rotated log files for this chain.
+    pub async fn rotated_files(&self) -> Result<Vec<PathBuf>> {
+        let parent = self.path.parent().unwrap_or(Path::new("."));
+        let stem = self.path.file_name().unwrap_or_default().to_string_lossy();
+
+        let mut files = Vec::new();
+        let mut dir = fs::read_dir(parent).await.context("reading audit dir")?;
+        while let Some(entry) = dir.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&*stem) && name != *stem {
+                files.push(entry.path());
+            }
+        }
+        files.sort();
+        Ok(files)
     }
 }
 

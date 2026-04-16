@@ -42,6 +42,10 @@ fn test_manifest() -> ContractManifest {
             active: true,
         }],
         shadow_tier: None,
+        destructive_allowlist: vec![],
+        max_binary_size: 10 * 1024 * 1024,
+        blocked_elicitation_types: vec!["password".into(), "secret".into(), "credential".into()],
+        audit_max_file_size: 50 * 1024 * 1024,
     }
 }
 
@@ -483,7 +487,8 @@ async fn egress_response_is_audited() {
     // 4. Read back as generic JSON values to check the mixed-type chain
     let raw = tokio::fs::read_to_string(&log_path).await.unwrap();
     let lines: Vec<&str> = raw.trim().lines().collect();
-    assert_eq!(lines.len(), 2, "should have 1 decision + 1 egress entry");
+    // 1 decision + 1 egress + 1 multimodal content log = 3
+    assert_eq!(lines.len(), 3, "should have 1 decision + 1 egress + 1 multimodal entry");
 
     // The second entry should be the egress log with a content_hash field
     let egress: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -1103,4 +1108,491 @@ async fn boot_signed_wrong_key_fails() {
         result.is_err(),
         "boot_signed must fail with wrong verifying key"
     );
+}
+
+// ── M4: Full MCP 2025-11-25 Compliance tests ──────────────────────────────
+
+use arbiter_mcp::compliance::{extract_content_blocks, ToolRegistry};
+
+/// M4.1: Destructive tool is blocked when not in allowlist.
+#[tokio::test]
+async fn destructive_tool_blocked_by_interceptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("destruct_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let interceptor = Interceptor::new(engine);
+
+    // Register a destructive tool
+    let tools_list = serde_json::json!({
+        "result": {
+            "tools": [
+                {
+                    "name": "delete_database",
+                    "annotations": {
+                        "destructive_hint": true,
+                        "read_only_hint": false
+                    }
+                }
+            ]
+        }
+    })
+    .to_string();
+    interceptor.ingest_tools_list(&tools_list).await.unwrap();
+
+    // Attempt to call the destructive tool — should be refused
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 100,
+        "method": "tools/call",
+        "params": {"name": "delete_database", "arguments": {"target": "production"}}
+    })
+    .to_string();
+
+    let result = evaluate_message(&interceptor, &msg).await.unwrap();
+    match result {
+        EvaluateResult::Block { response_json } => {
+            let resp: serde_json::Value = serde_json::from_str(&response_json).unwrap();
+            assert!(resp["error"]["message"].as_str().unwrap().contains("destructive"));
+        }
+        _ => panic!("destructive tool not in allowlist should be blocked"),
+    }
+}
+
+/// M4.1: Destructive tool is allowed when explicitly in the allowlist.
+#[tokio::test]
+async fn destructive_tool_allowed_when_in_allowlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("destruct_allow_audit.jsonl");
+
+    let mut manifest = test_manifest();
+    manifest.destructive_allowlist = vec!["delete_database".to_string()];
+
+    let engine = Engine::boot_from_manifest(manifest, &log_path)
+        .await
+        .unwrap();
+    let interceptor = Interceptor::new(engine);
+
+    // Register a destructive tool
+    let tools_list = serde_json::json!({
+        "result": {
+            "tools": [
+                {
+                    "name": "delete_database",
+                    "annotations": {
+                        "destructive_hint": true
+                    }
+                }
+            ]
+        }
+    })
+    .to_string();
+    interceptor.ingest_tools_list(&tools_list).await.unwrap();
+
+    // Attempt to call the destructive tool — should be allowed (since in allowlist)
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 101,
+        "method": "tools/call",
+        "params": {"name": "delete_database", "arguments": {"target": "staging"}}
+    })
+    .to_string();
+
+    let result = evaluate_message(&interceptor, &msg).await.unwrap();
+    assert!(
+        matches!(result, EvaluateResult::Forward { .. }),
+        "destructive tool in allowlist should be forwarded"
+    );
+}
+
+/// M4.1: Tool annotations are ingested from tools/list response.
+#[tokio::test]
+async fn tool_registry_tracks_annotations() {
+    let registry = ToolRegistry::new();
+    let tools_list = serde_json::json!({
+        "result": {
+            "tools": [
+                {
+                    "name": "read_file",
+                    "annotations": {"read_only_hint": true}
+                },
+                {
+                    "name": "write_file",
+                    "annotations": {"destructive_hint": true, "open_world_hint": false}
+                }
+            ]
+        }
+    });
+
+    registry.ingest_tools_list(&tools_list).await.unwrap();
+    assert_eq!(registry.is_read_only("read_file").await, Some(true));
+    assert_eq!(registry.is_destructive("write_file").await, Some(true));
+    assert_eq!(registry.is_destructive("read_file").await, None);
+}
+
+/// M4.2: Schema validation catches missing required properties.
+#[tokio::test]
+async fn schema_validation_catches_violations() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("schema_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let interceptor = Interceptor::new(engine);
+
+    // Register a tool with output schema
+    let tools_list = serde_json::json!({
+        "result": {
+            "tools": [
+                {
+                    "name": "get_user",
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["name", "email"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "email": {"type": "string"},
+                            "age": {"type": "number"}
+                        }
+                    }
+                }
+            ]
+        }
+    })
+    .to_string();
+    interceptor.ingest_tools_list(&tools_list).await.unwrap();
+
+    // Response missing required "email" property
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 200,
+        "result": {"name": "Alice", "age": 30}
+    })
+    .to_string();
+
+    let violations = interceptor
+        .validate_tool_response("get_user", &response)
+        .await
+        .unwrap();
+
+    assert_eq!(violations.len(), 1);
+    assert!(violations[0].contains("email"));
+
+    // Check that a schema violation was logged to audit
+    let raw = tokio::fs::read_to_string(&log_path).await.unwrap();
+    assert!(raw.contains("email"), "schema violation should be in audit log");
+}
+
+/// M4.2: Valid response passes schema validation.
+#[tokio::test]
+async fn schema_validation_passes_valid_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("schema_valid_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let interceptor = Interceptor::new(engine);
+
+    let tools_list = serde_json::json!({
+        "result": {
+            "tools": [
+                {
+                    "name": "get_user",
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {
+                            "name": {"type": "string"}
+                        }
+                    }
+                }
+            ]
+        }
+    })
+    .to_string();
+    interceptor.ingest_tools_list(&tools_list).await.unwrap();
+
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 201,
+        "result": {"name": "Alice"}
+    })
+    .to_string();
+
+    let violations = interceptor
+        .validate_tool_response("get_user", &response)
+        .await
+        .unwrap();
+
+    assert!(violations.is_empty(), "valid response should have no violations");
+}
+
+/// M4.3: Multi-modal response content blocks are logged.
+#[tokio::test]
+async fn multimodal_content_logged_on_egress() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("multimodal_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let interceptor = Interceptor::new(engine);
+
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 300,
+        "result": {
+            "content": [
+                {"type": "text", "text": "Here is the image analysis"},
+                {"type": "image", "data": "SGVsbG8=", "mimeType": "image/png"}
+            ]
+        }
+    })
+    .to_string();
+
+    interceptor.log_egress(&response).await.unwrap();
+
+    let raw = tokio::fs::read_to_string(&log_path).await.unwrap();
+    let lines: Vec<&str> = raw.trim().lines().collect();
+    // Should have: 1 egress entry + 1 multimodal entry
+    assert_eq!(lines.len(), 2, "should have egress + multimodal entries");
+
+    let mm: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(mm["blocks"].as_array().unwrap().len(), 2);
+    assert_eq!(mm["blocks"][0]["content_type"], "text");
+    assert_eq!(mm["blocks"][1]["content_type"], "image");
+    assert_eq!(mm["blocks"][1]["mime_type"], "image/png");
+}
+
+/// M4.3: Binary content exceeding size limit is rejected.
+#[test]
+fn multimodal_binary_size_limit_enforced() {
+    let large_data = "AAAA".repeat(1000); // ~3000 bytes decoded
+    let response = serde_json::json!({
+        "result": {
+            "content": [
+                {"type": "image", "data": large_data, "mimeType": "image/png"}
+            ]
+        }
+    });
+    let result = extract_content_blocks(&response, 100);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("exceeds max size"));
+}
+
+/// M4.4: Elicitation requesting a password is blocked.
+#[tokio::test]
+async fn elicitation_password_blocked() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("elicit_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let interceptor = Interceptor::new(engine);
+
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 400,
+        "method": "elicitation/create",
+        "params": {
+            "message": "Enter your password to continue",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "password": {"type": "string"}
+                }
+            }
+        }
+    })
+    .to_string();
+
+    let result = interceptor
+        .process_raw(&msg)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(result, arbiter_mcp::InterceptResult::Refuse(_)),
+        "elicitation for password must be refused"
+    );
+
+    // Verify elicitation event was logged
+    let raw = tokio::fs::read_to_string(&log_path).await.unwrap();
+    assert!(raw.contains("elicitation blocked"));
+}
+
+/// M4.4: Elicitation requesting a name is allowed.
+#[tokio::test]
+async fn elicitation_name_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("elicit_allow_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let interceptor = Interceptor::new(engine);
+
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 401,
+        "method": "elicitation/create",
+        "params": {
+            "message": "What is your name?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"}
+                }
+            }
+        }
+    })
+    .to_string();
+
+    let result = interceptor
+        .process_raw(&msg)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(result, arbiter_mcp::InterceptResult::Allow { .. }),
+        "elicitation for name should be allowed"
+    );
+}
+
+/// M4.5: Audit log rotation occurs when file exceeds max size.
+#[tokio::test]
+async fn audit_log_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("rotation_audit.jsonl");
+
+    let mut chain = AuditChain::open(&log_path).await.unwrap();
+
+    // Write entries until we exceed a small threshold
+    for i in 0..100 {
+        let entry = DecisionLogEntry {
+            timestamp: Utc::now(),
+            task_id: format!("rot-{i}"),
+            agent: "test".into(),
+            rationale: "rotation test entry with enough content to reach size limit".into(),
+            outcome: None,
+        };
+        chain.append(&entry).await.unwrap();
+    }
+
+    let size_before = chain.current_size();
+    assert!(size_before > 0);
+
+    // Rotate with a very small limit to force rotation
+    let rotated = chain.rotate_if_needed(100).await.unwrap();
+    assert!(rotated, "rotation should have occurred");
+    assert_eq!(chain.current_size(), 0, "new file should start at 0 bytes");
+
+    // Verify the rotated file exists
+    let rotated_path = format!("{}.1", log_path.display());
+    assert!(
+        std::path::Path::new(&rotated_path).exists(),
+        "rotated file should exist"
+    );
+
+    // Continue writing — chain continuity
+    let entry = DecisionLogEntry {
+        timestamp: Utc::now(),
+        task_id: "post-rotation".into(),
+        agent: "test".into(),
+        rationale: "after rotation".into(),
+        outcome: None,
+    };
+    chain.append(&entry).await.unwrap();
+
+    // Verify the new file has one entry
+    let raw = tokio::fs::read_to_string(&log_path).await.unwrap();
+    let lines: Vec<&str> = raw.trim().lines().collect();
+    assert_eq!(lines.len(), 1);
+
+    // Verify the rotated file is valid
+    assert!(AuditChain::verify(&rotated_path).await.unwrap());
+}
+
+/// M4.5: Audit query by time range works.
+#[tokio::test]
+async fn audit_query_by_time_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("query_audit.jsonl");
+
+    let mut chain = AuditChain::open(&log_path).await.unwrap();
+
+    let t1 = Utc::now();
+    let entry1 = DecisionLogEntry {
+        timestamp: t1,
+        task_id: "query-1".into(),
+        agent: "test".into(),
+        rationale: "first".into(),
+        outcome: None,
+    };
+    chain.append(&entry1).await.unwrap();
+
+    let entry2 = DecisionLogEntry {
+        timestamp: Utc::now(),
+        task_id: "query-2".into(),
+        agent: "test".into(),
+        rationale: "second".into(),
+        outcome: None,
+    };
+    chain.append(&entry2).await.unwrap();
+
+    // Query all entries
+    let all = chain.query_by_time_range(None, None).await.unwrap();
+    assert_eq!(all.len(), 2);
+
+    // Query with a predicate
+    let filtered = chain
+        .query(|v| v.get("task_id").and_then(|t| t.as_str()) == Some("query-1"))
+        .await
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0]["task_id"], "query-1");
+}
+
+/// M4.5: Rotated files are discoverable.
+#[tokio::test]
+async fn audit_rotated_files_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("list_audit.jsonl");
+
+    let mut chain = AuditChain::open(&log_path).await.unwrap();
+
+    // Write enough to rotate twice
+    for i in 0..50 {
+        let entry = DecisionLogEntry {
+            timestamp: Utc::now(),
+            task_id: format!("list-{i}"),
+            agent: "test".into(),
+            rationale: "list test".into(),
+            outcome: None,
+        };
+        chain.append(&entry).await.unwrap();
+    }
+
+    chain.rotate_if_needed(100).await.unwrap();
+
+    for i in 50..100 {
+        let entry = DecisionLogEntry {
+            timestamp: Utc::now(),
+            task_id: format!("list-{i}"),
+            agent: "test".into(),
+            rationale: "list test".into(),
+            outcome: None,
+        };
+        chain.append(&entry).await.unwrap();
+    }
+
+    chain.rotate_if_needed(100).await.unwrap();
+
+    let files = chain.rotated_files().await.unwrap();
+    assert_eq!(files.len(), 2, "should have 2 rotated files");
 }

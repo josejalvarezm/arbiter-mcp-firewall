@@ -16,6 +16,21 @@ pub struct ContractManifest {
     /// Optional shadow-tier classifier configuration.
     #[serde(default)]
     pub shadow_tier: Option<ShadowConfig>,
+    /// Tools explicitly allowed to perform destructive operations.
+    /// If empty, ALL destructive tools are blocked by default.
+    #[serde(default)]
+    pub destructive_allowlist: Vec<String>,
+    /// Maximum binary content size in bytes (images/audio).
+    /// Default: 10 MiB.
+    #[serde(default = "default_max_binary_size")]
+    pub max_binary_size: usize,
+    /// Elicitation data types that are blocked (e.g., "password", "secret").
+    #[serde(default)]
+    pub blocked_elicitation_types: Vec<String>,
+    /// Audit log rotation: max file size in bytes before rotating.
+    /// Default: 50 MiB. 0 = no rotation.
+    #[serde(default = "default_audit_max_size")]
+    pub audit_max_file_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,4 +62,12 @@ pub struct ShadowConfig {
 
 fn default_confidence_threshold() -> f64 {
     0.7
+}
+
+fn default_max_binary_size() -> usize {
+    10 * 1024 * 1024 // 10 MiB
+}
+
+fn default_audit_max_size() -> usize {
+    50 * 1024 * 1024 // 50 MiB
 }

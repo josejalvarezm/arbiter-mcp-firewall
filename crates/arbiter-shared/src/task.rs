@@ -66,3 +66,94 @@ pub struct ShadowLogEntry {
     /// Classifier latency in milliseconds.
     pub latency_ms: f64,
 }
+
+// ── M4 types ───────────────────────────────────────────────────────────────
+
+/// MCP tool annotations from `tools/list` responses (MCP 2025-11-25).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolAnnotations {
+    /// If true, the tool may perform destructive operations (write/delete).
+    #[serde(default)]
+    pub destructive_hint: Option<bool>,
+    /// If true, the tool only reads data and has no side effects.
+    #[serde(default)]
+    pub read_only_hint: Option<bool>,
+    /// If true, the tool interacts with external/open-world systems.
+    #[serde(default)]
+    pub open_world_hint: Option<bool>,
+}
+
+/// A registered tool's metadata, captured from `tools/list` responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolMeta {
+    pub name: String,
+    pub annotations: ToolAnnotations,
+    /// JSON Schema for the tool's output, if declared.
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Value>,
+}
+
+/// Content types for multi-modal MCP messages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentType {
+    Text,
+    Image,
+    Audio,
+    Resource,
+}
+
+/// A content block extracted from an MCP response (text, image, or audio).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentBlock {
+    pub content_type: ContentType,
+    /// SHA-256 hex digest of the content (text bytes or binary data).
+    pub content_hash: String,
+    /// Byte length of the raw content.
+    pub size_bytes: usize,
+    /// MIME type for binary content (e.g. "image/png", "audio/wav").
+    #[serde(default)]
+    pub mime_type: Option<String>,
+}
+
+/// Audit entry for tool annotation inconsistency detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnotationInconsistencyEntry {
+    pub timestamp: DateTime<Utc>,
+    pub tool_name: String,
+    pub declared_read_only: bool,
+    pub observed_behavior: String,
+    pub request_id: Option<serde_json::Value>,
+}
+
+/// Audit entry for schema validation results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaViolationEntry {
+    pub timestamp: DateTime<Utc>,
+    pub tool_name: String,
+    pub request_id: Option<serde_json::Value>,
+    /// Description of the schema mismatch.
+    pub violation: String,
+}
+
+/// Audit entry for elicitation interception.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElicitationLogEntry {
+    pub timestamp: DateTime<Utc>,
+    pub request_id: Option<serde_json::Value>,
+    /// The data type the server is requesting (e.g., "password", "email").
+    pub requested_type: String,
+    /// Whether the elicitation was allowed or blocked.
+    pub allowed: bool,
+    /// Reason for the decision.
+    pub reason: String,
+}
+
+/// Audit entry for multi-modal content pass-through.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiModalLogEntry {
+    pub timestamp: DateTime<Utc>,
+    pub request_id: Option<serde_json::Value>,
+    pub blocks: Vec<ContentBlock>,
+    pub total_size_bytes: usize,
+}

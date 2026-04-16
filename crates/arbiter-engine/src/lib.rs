@@ -327,6 +327,10 @@ mod tests {
                 active: true,
             }],
             shadow_tier: None,
+            destructive_allowlist: vec![],
+            max_binary_size: 10 * 1024 * 1024,
+            blocked_elicitation_types: vec![],
+            audit_max_file_size: 50 * 1024 * 1024,
         }
     }
 
