@@ -1,5 +1,6 @@
 pub mod policy;
 pub mod shadow;
+pub mod signing;
 
 use anyhow::{Context, Result};
 use arbiter_audit::AuditChain;
@@ -9,6 +10,7 @@ use arbiter_shared::task::{DecisionLogEntry, Task, TaskStatus};
 use policy::{PolicyEngine, PolicyVerdict};
 use sha2::{Digest, Sha256};
 use shadow::ShadowClient;
+use signing::VerifyingKeyBytes;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -78,6 +80,34 @@ impl Engine {
         }
 
         tracing::info!("manifest integrity check passed");
+
+        let manifest: ContractManifest =
+            serde_json::from_str(&data).context("parsing contract manifest")?;
+
+        Self::boot_from_manifest(manifest, audit_path).await
+    }
+
+    /// Boot from a manifest file with Ed25519 signature verification.
+    ///
+    /// Verifies the manifest content against the provided signature
+    /// using the compiled-in public key. Returns an error if the
+    /// signature is invalid.
+    #[instrument(skip_all, fields(manifest = %manifest_path.as_ref().display()))]
+    pub async fn boot_signed(
+        manifest_path: impl AsRef<Path>,
+        audit_path: impl AsRef<Path>,
+        signature_hex: &str,
+        verifying_key: &VerifyingKeyBytes,
+    ) -> Result<Self> {
+        let data = tokio::fs::read_to_string(manifest_path.as_ref())
+            .await
+            .context("reading contract manifest")?;
+
+        if !signing::verify_manifest(&data, signature_hex, verifying_key)? {
+            anyhow::bail!("manifest Ed25519 signature verification failed");
+        }
+
+        tracing::info!("manifest Ed25519 signature verified");
 
         let manifest: ContractManifest =
             serde_json::from_str(&data).context("parsing contract manifest")?;

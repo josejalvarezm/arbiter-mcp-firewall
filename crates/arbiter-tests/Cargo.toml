@@ -16,6 +16,9 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 tempfile = "3"
 futures = "0.3"
+axum = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [[bin]]
 name = "latency_bench"

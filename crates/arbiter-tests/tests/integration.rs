@@ -658,3 +658,449 @@ async fn shadow_would_refuse_is_logged() {
 
     mock_server.abort();
 }
+
+// ── M3: Transport Security tests ───────────────────────────────────────────
+
+use arbiter_mcp::http::{build_router, HttpConfig};
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
+use tower::ServiceExt;
+
+fn test_http_config() -> HttpConfig {
+    HttpConfig {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        auth_token: "test-secret-token".to_string(),
+        allowed_origins: vec!["https://allowed.example.com".to_string()],
+        rate_limit_per_minute: 5,
+    }
+}
+
+async fn make_router() -> axum::Router {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("http_test_audit.jsonl");
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let interceptor = Interceptor::new(engine);
+    // Leak the tempdir so the audit path stays valid through the test
+    std::mem::forget(dir);
+    build_router(interceptor, test_http_config())
+}
+
+/// M3.2: Health endpoint with valid Bearer token returns 200 OK.
+#[tokio::test]
+async fn http_health_with_auth() {
+    let router = make_router().await;
+    let resp = router
+        .oneshot(
+            Request::get("/health")
+                .header("authorization", "Bearer test-secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+}
+
+/// M3.2: Missing Bearer token returns 401 Unauthorized.
+#[tokio::test]
+async fn http_missing_auth_returns_unauthorized() {
+    let router = make_router().await;
+    let resp = router
+        .oneshot(
+            Request::get("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// M3.2: Wrong Bearer token returns 401 Unauthorized.
+#[tokio::test]
+async fn http_wrong_auth_returns_unauthorized() {
+    let router = make_router().await;
+    let resp = router
+        .oneshot(
+            Request::get("/health")
+                .header("authorization", "Bearer wrong-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// M3.2: .well-known endpoint skips auth (RFC 9728).
+#[tokio::test]
+async fn http_well_known_skips_auth() {
+    let router = make_router().await;
+    let resp = router
+        .oneshot(
+            Request::get("/.well-known/oauth-protected-resource")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["resource"], "arbiter-mcp-firewall");
+}
+
+/// M3.3: Disallowed Origin header returns 403 Forbidden.
+#[tokio::test]
+async fn http_disallowed_origin_returns_forbidden() {
+    let router = make_router().await;
+    let resp = router
+        .oneshot(
+            Request::get("/health")
+                .header("authorization", "Bearer test-secret-token")
+                .header("origin", "https://evil.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// M3.3: Allowed Origin header passes through.
+#[tokio::test]
+async fn http_allowed_origin_passes() {
+    let router = make_router().await;
+    let resp = router
+        .oneshot(
+            Request::get("/health")
+                .header("authorization", "Bearer test-secret-token")
+                .header("origin", "https://allowed.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// M3.1: POST /mcp with initialize creates a session and returns Mcp-Session-Id.
+#[tokio::test]
+async fn http_initialize_creates_session() {
+    let router = make_router().await;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {}
+    })
+    .to_string();
+
+    let resp = router
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", "Bearer test-secret-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("mcp-session-id").is_some(),
+        "response must contain Mcp-Session-Id header"
+    );
+    assert_eq!(
+        resp.headers().get("mcp-protocol-version").unwrap(),
+        "2025-11-25"
+    );
+}
+
+/// M3.1: Non-initialize request without Mcp-Session-Id returns 400.
+#[tokio::test]
+async fn http_missing_session_id_returns_bad_request() {
+    let router = make_router().await;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": "summarise_report", "arguments": {"text": "quarterly"}}
+    })
+    .to_string();
+
+    let resp = router
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", "Bearer test-secret-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// M3.1: Full session lifecycle — initialize → tools/call → DELETE → GONE.
+#[tokio::test]
+async fn http_session_lifecycle() {
+    let router = make_router().await;
+
+    // 1. Initialize — creates session
+    let init_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {}
+    })
+    .to_string();
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", "Bearer test-secret-token")
+                .header("content-type", "application/json")
+                .body(Body::from(init_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let session_id = resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // 2. tools/call with valid session — forwarded
+    let call_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": "summarise_report", "arguments": {"text": "quarterly earnings"}}
+    })
+    .to_string();
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", "Bearer test-secret-token")
+                .header("content-type", "application/json")
+                .header("mcp-session-id", &session_id)
+                .body(Body::from(call_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 3. DELETE — close session
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::delete("/mcp")
+                .header("authorization", "Bearer test-secret-token")
+                .header("mcp-session-id", &session_id)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 4. Request on closed session — 410 Gone
+    let post_close_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {"name": "summarise_report", "arguments": {"text": "test"}}
+    })
+    .to_string();
+
+    let resp = router
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", "Bearer test-secret-token")
+                .header("content-type", "application/json")
+                .header("mcp-session-id", &session_id)
+                .body(Body::from(post_close_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::GONE);
+}
+
+/// M3.3: Rate limiting — exceed the token bucket, get 429.
+#[tokio::test]
+async fn http_rate_limit_returns_too_many_requests() {
+    let router = make_router().await;
+
+    // Initialize a session first
+    let init_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {}
+    })
+    .to_string();
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", "Bearer test-secret-token")
+                .header("content-type", "application/json")
+                .body(Body::from(init_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let session_id = resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Exhaust the rate limit (configured at 5 per minute).
+    let mut last_status = StatusCode::OK;
+    for i in 0..10 {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": i + 10,
+            "method": "tools/call",
+            "params": {"name": "summarise_report", "arguments": {"text": "test"}}
+        })
+        .to_string();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::post("/mcp")
+                    .header("authorization", "Bearer test-secret-token")
+                    .header("content-type", "application/json")
+                    .header("mcp-session-id", &session_id)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        last_status = resp.status();
+        if last_status == StatusCode::TOO_MANY_REQUESTS {
+            break;
+        }
+    }
+
+    assert_eq!(
+        last_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "should eventually get 429 after exceeding rate limit"
+    );
+}
+
+/// M3.4: Ed25519 boot_signed succeeds with valid signature.
+#[tokio::test]
+async fn boot_signed_valid_signature() {
+    use arbiter_engine::signing::{generate_keypair, sign_manifest};
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("manifest.json");
+    let audit_path = dir.path().join("signed_audit.jsonl");
+
+    let manifest = test_manifest();
+    let manifest_json = serde_json::to_string_pretty(&manifest).unwrap();
+    tokio::fs::write(&manifest_path, &manifest_json)
+        .await
+        .unwrap();
+
+    let (sk, vk) = generate_keypair();
+    let signature = sign_manifest(&manifest_json, &sk);
+
+    let engine = Engine::boot_signed(&manifest_path, &audit_path, &signature, &vk)
+        .await
+        .unwrap();
+
+    // Verify the engine works
+    let task = Task {
+        id: "signed-test".into(),
+        task_type: "summarise".into(),
+        payload: serde_json::json!({"text": "quarterly report"}),
+        submitted_at: Utc::now(),
+    };
+    let result = engine.evaluate(&task).await.unwrap();
+    assert!(matches!(result, arbiter_engine::EvalResult::Allow { .. }));
+}
+
+/// M3.4: boot_signed rejects tampered manifest.
+#[tokio::test]
+async fn boot_signed_tampered_manifest_fails() {
+    use arbiter_engine::signing::{generate_keypair, sign_manifest};
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("manifest.json");
+    let audit_path = dir.path().join("tampered_audit.jsonl");
+
+    let manifest = test_manifest();
+    let manifest_json = serde_json::to_string_pretty(&manifest).unwrap();
+
+    // Sign the original
+    let (sk, vk) = generate_keypair();
+    let signature = sign_manifest(&manifest_json, &sk);
+
+    // Write tampered content
+    let tampered = manifest_json.replace("\"1\"", "\"999\"");
+    tokio::fs::write(&manifest_path, &tampered).await.unwrap();
+
+    let result = Engine::boot_signed(&manifest_path, &audit_path, &signature, &vk).await;
+    assert!(
+        result.is_err(),
+        "boot_signed must fail with tampered manifest"
+    );
+    let err_msg = result.err().unwrap().to_string();
+    assert!(
+        err_msg.contains("signature verification failed"),
+        "error must mention signature verification, got: {err_msg}"
+    );
+}
+
+/// M3.4: boot_signed rejects wrong key.
+#[tokio::test]
+async fn boot_signed_wrong_key_fails() {
+    use arbiter_engine::signing::{generate_keypair, sign_manifest};
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("manifest.json");
+    let audit_path = dir.path().join("wrongkey_audit.jsonl");
+
+    let manifest = test_manifest();
+    let manifest_json = serde_json::to_string_pretty(&manifest).unwrap();
+    tokio::fs::write(&manifest_path, &manifest_json)
+        .await
+        .unwrap();
+
+    let (sk, _vk) = generate_keypair();
+    let (_sk2, vk2) = generate_keypair();
+    let signature = sign_manifest(&manifest_json, &sk);
+
+    let result = Engine::boot_signed(&manifest_path, &audit_path, &signature, &vk2).await;
+    assert!(
+        result.is_err(),
+        "boot_signed must fail with wrong verifying key"
+    );
+}

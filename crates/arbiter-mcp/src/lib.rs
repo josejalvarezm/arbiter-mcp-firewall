@@ -11,6 +11,7 @@
 //! is the caller's responsibility — or use `firewall::Firewall` for stdio.
 
 pub mod firewall;
+pub mod http;
 
 use anyhow::{Context, Result};
 use arbiter_engine::{Engine, EvalResult};
@@ -90,6 +91,7 @@ fn is_passthrough_method(method: &str) -> bool {
 }
 
 /// The MCP policy interceptor. Wraps an Arbiter engine.
+#[derive(Clone)]
 pub struct Interceptor {
     engine: Engine,
 }
