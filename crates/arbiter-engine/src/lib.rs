@@ -2,12 +2,14 @@ pub mod policy;
 
 use anyhow::{Context, Result};
 use arbiter_audit::AuditChain;
-use arbiter_shared::boundary::{PolicyBoundary, RefusalRecord};
+use arbiter_shared::boundary::RefusalRecord;
 use arbiter_shared::contract::ContractManifest;
 use arbiter_shared::task::{DecisionLogEntry, Task, TaskStatus};
 use policy::{PolicyEngine, PolicyVerdict};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::instrument;
 
 /// The result of an engine evaluation.
@@ -21,10 +23,14 @@ pub enum EvalResult {
 
 /// The Arbiter engine: loads a contract manifest, evaluates tasks against policy
 /// boundaries, and logs every decision to a hash-chained audit trail.
+///
+/// The engine is `Clone + Send + Sync`: policy evaluation is lock-free (read-only),
+/// and audit writes are serialized through an internal `Mutex<AuditChain>`.
+#[derive(Clone)]
 pub struct Engine {
     manifest: ContractManifest,
-    policy_engine: PolicyEngine,
-    audit: AuditChain,
+    policy_engine: Arc<PolicyEngine>,
+    audit: Arc<Mutex<AuditChain>>,
 }
 
 impl Engine {
@@ -99,16 +105,17 @@ impl Engine {
 
         Ok(Engine {
             manifest,
-            policy_engine,
-            audit,
+            policy_engine: Arc::new(policy_engine),
+            audit: Arc::new(Mutex::new(audit)),
         })
     }
 
     /// Evaluate a task: enforce policy boundaries, then route.
     ///
     /// Every decision (allow or refuse) is logged to the audit chain.
+    /// Policy evaluation is lock-free; only the audit write acquires a mutex.
     #[instrument(skip(self), fields(task_id = %task.id, task_type = %task.task_type))]
-    pub async fn evaluate(&mut self, task: &Task) -> Result<EvalResult> {
+    pub async fn evaluate(&self, task: &Task) -> Result<EvalResult> {
         match self.policy_engine.evaluate(task) {
             PolicyVerdict::Refuse(refusal) => {
                 let entry = DecisionLogEntry {
@@ -118,7 +125,7 @@ impl Engine {
                     rationale: refusal.reason.clone(),
                     outcome: Some(TaskStatus::Refused),
                 };
-                self.audit.append(&entry).await?;
+                self.audit.lock().await.append(&entry).await?;
 
                 tracing::warn!(
                     boundary = %refusal.boundary_id,
@@ -137,7 +144,7 @@ impl Engine {
                     rationale: rationale.clone(),
                     outcome: None,
                 };
-                self.audit.append(&entry).await?;
+                self.audit.lock().await.append(&entry).await?;
 
                 tracing::info!(agent = %agent_id, "task allowed and routed");
 
@@ -186,23 +193,6 @@ impl Engine {
         }
     }
 
-    /// Register an additional policy boundary at runtime.
-    pub fn add_boundary(&mut self, boundary: PolicyBoundary) {
-        self.policy_engine.add_boundary(boundary);
-    }
-
-    /// Supersede an existing boundary with a new one.
-    pub fn supersede_boundary(
-        &mut self,
-        old_id: &str,
-        new_boundary: PolicyBoundary,
-        authorised_by: &str,
-        reason: &str,
-    ) -> Option<arbiter_shared::boundary::RuleSupersession> {
-        self.policy_engine
-            .supersede(old_id, new_boundary, authorised_by, reason)
-    }
-
     pub fn manifest(&self) -> &ContractManifest {
         &self.manifest
     }
@@ -211,8 +201,9 @@ impl Engine {
         &self.policy_engine
     }
 
-    pub fn audit(&self) -> &AuditChain {
-        &self.audit
+    /// Access the audit chain (requires async lock).
+    pub async fn audit(&self) -> tokio::sync::MutexGuard<'_, AuditChain> {
+        self.audit.lock().await
     }
 }
 
@@ -274,7 +265,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("test.jsonl");
 
-        let mut engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
             .await
             .unwrap();
 
@@ -294,7 +285,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("test.jsonl");
 
-        let mut engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
             .await
             .unwrap();
 
@@ -314,7 +305,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("test.jsonl");
 
-        let mut engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
             .await
             .unwrap();
 

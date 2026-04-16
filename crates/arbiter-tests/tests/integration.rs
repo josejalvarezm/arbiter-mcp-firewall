@@ -4,14 +4,13 @@
 
 use arbiter_audit::AuditChain;
 use arbiter_engine::Engine;
-use arbiter_mcp::firewall::{evaluate_message, EvaluateResult};
+use arbiter_mcp::firewall::{evaluate_message, log_response, EvaluateResult};
 use arbiter_mcp::Interceptor;
 use arbiter_shared::boundary::{BoundaryCategory, PolicyBoundary};
 use arbiter_shared::contract::{AgentContract, ContractManifest, GlobalContract};
 use arbiter_shared::task::{DecisionLogEntry, Task};
 use chrono::Utc;
 use std::collections::HashMap;
-
 fn test_manifest() -> ContractManifest {
     let mut agents = HashMap::new();
     agents.insert(
@@ -52,7 +51,7 @@ async fn engine_allow_and_refuse_with_audit() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("integration_audit.jsonl");
 
-    let mut engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
         .await
         .unwrap();
 
@@ -91,7 +90,7 @@ async fn engine_allow_and_refuse_with_audit() {
     );
 
     let entries: Vec<arbiter_audit::ChainedEntry<DecisionLogEntry>> =
-        engine.audit().read_all().await.unwrap();
+        engine.audit().await.read_all().await.unwrap();
     assert_eq!(entries.len(), 2, "should have exactly 2 audit entries");
 
     assert_eq!(entries[0].data.task_id, "task-benign");
@@ -114,7 +113,7 @@ async fn mcp_intercept_with_audit() {
     let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
         .await
         .unwrap();
-    let mut interceptor = Interceptor::new(engine);
+    let interceptor = Interceptor::new(engine);
 
     // --- Allowed tool call ---
     let allowed_request = serde_json::json!({
@@ -172,7 +171,7 @@ async fn firewall_evaluate_message_allows() {
     let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
         .await
         .unwrap();
-    let mut interceptor = Interceptor::new(engine);
+    let interceptor = Interceptor::new(engine);
 
     let msg = serde_json::json!({
         "jsonrpc": "2.0",
@@ -185,7 +184,7 @@ async fn firewall_evaluate_message_allows() {
     })
     .to_string();
 
-    let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+    let result = evaluate_message(&interceptor, &msg).await.unwrap();
     assert!(
         matches!(result, EvaluateResult::Forward { .. }),
         "benign message should be forwarded"
@@ -201,7 +200,7 @@ async fn firewall_evaluate_message_blocks() {
     let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
         .await
         .unwrap();
-    let mut interceptor = Interceptor::new(engine);
+    let interceptor = Interceptor::new(engine);
 
     let msg = serde_json::json!({
         "jsonrpc": "2.0",
@@ -214,7 +213,7 @@ async fn firewall_evaluate_message_blocks() {
     })
     .to_string();
 
-    let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+    let result = evaluate_message(&interceptor, &msg).await.unwrap();
     match result {
         EvaluateResult::Block { response_json } => {
             let resp: serde_json::Value = serde_json::from_str(&response_json).unwrap();
@@ -234,7 +233,7 @@ async fn firewall_evaluate_message_passthrough() {
     let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
         .await
         .unwrap();
-    let mut interceptor = Interceptor::new(engine);
+    let interceptor = Interceptor::new(engine);
 
     let msg = serde_json::json!({
         "jsonrpc": "2.0",
@@ -244,7 +243,7 @@ async fn firewall_evaluate_message_passthrough() {
     })
     .to_string();
 
-    let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+    let result = evaluate_message(&interceptor, &msg).await.unwrap();
     assert!(
         matches!(result, EvaluateResult::Forward { .. }),
         "non-tool-call methods should pass through"
@@ -264,7 +263,7 @@ async fn default_deny_resources_read_is_evaluated() {
     let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
         .await
         .unwrap();
-    let mut interceptor = Interceptor::new(engine);
+    let interceptor = Interceptor::new(engine);
 
     // resources/read with params containing boundary-triggering keywords.
     // The method name "resources/read" normalises to "resourcesread" (no slash),
@@ -280,7 +279,7 @@ async fn default_deny_resources_read_is_evaluated() {
     })
     .to_string();
 
-    let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+    let result = evaluate_message(&interceptor, &msg).await.unwrap();
     match result {
         EvaluateResult::Block { response_json } => {
             let resp: serde_json::Value = serde_json::from_str(&response_json).unwrap();
@@ -301,7 +300,7 @@ async fn default_deny_sampling_is_evaluated() {
     let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
         .await
         .unwrap();
-    let mut interceptor = Interceptor::new(engine);
+    let interceptor = Interceptor::new(engine);
 
     // sampling/createMessage with content referencing credentials
     let msg = serde_json::json!({
@@ -315,7 +314,7 @@ async fn default_deny_sampling_is_evaluated() {
     })
     .to_string();
 
-    let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+    let result = evaluate_message(&interceptor, &msg).await.unwrap();
     match result {
         EvaluateResult::Block { response_json } => {
             let resp: serde_json::Value = serde_json::from_str(&response_json).unwrap();
@@ -336,7 +335,7 @@ async fn default_deny_prompts_is_evaluated() {
     let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
         .await
         .unwrap();
-    let mut interceptor = Interceptor::new(engine);
+    let interceptor = Interceptor::new(engine);
 
     let msg = serde_json::json!({
         "jsonrpc": "2.0",
@@ -348,7 +347,7 @@ async fn default_deny_prompts_is_evaluated() {
     })
     .to_string();
 
-    let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+    let result = evaluate_message(&interceptor, &msg).await.unwrap();
     match result {
         EvaluateResult::Block { response_json } => {
             let resp: serde_json::Value = serde_json::from_str(&response_json).unwrap();
@@ -360,6 +359,54 @@ async fn default_deny_prompts_is_evaluated() {
     }
 }
 
+/// M1.4: 100 concurrent evaluations on a shared Engine produce a valid audit chain.
+#[tokio::test]
+async fn concurrent_evaluations_are_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("concurrent_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+
+    let mut handles = Vec::new();
+    for i in 0..100 {
+        let eng = engine.clone();
+        handles.push(tokio::spawn(async move {
+            let task = Task {
+                id: format!("conc-{i}"),
+                task_type: "summarise".into(),
+                payload: serde_json::json!({"text": "quarterly report"}),
+                submitted_at: Utc::now(),
+            };
+            eng.evaluate(&task).await.unwrap()
+        }));
+    }
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(results.len(), 100);
+    for r in &results {
+        assert!(
+            matches!(r, arbiter_engine::EvalResult::Allow { .. }),
+            "all concurrent benign tasks should be allowed"
+        );
+    }
+
+    // Audit chain must be intact with exactly 100 entries.
+    assert!(
+        AuditChain::verify(&log_path).await.unwrap(),
+        "audit hash chain must be valid after concurrent writes"
+    );
+    let entries: Vec<arbiter_audit::ChainedEntry<arbiter_shared::task::DecisionLogEntry>> =
+        engine.audit().await.read_all().await.unwrap();
+    assert_eq!(entries.len(), 100, "should have exactly 100 audit entries");
+}
+
 /// Allowlisted protocol methods still pass through after M0.1.
 #[tokio::test]
 async fn allowlisted_methods_still_pass_through() {
@@ -369,7 +416,7 @@ async fn allowlisted_methods_still_pass_through() {
     let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
         .await
         .unwrap();
-    let mut interceptor = Interceptor::new(engine);
+    let interceptor = Interceptor::new(engine);
 
     // Test each allowlisted method
     for method in &["ping", "initialize", "initialized", "notifications/initialized"] {
@@ -381,10 +428,68 @@ async fn allowlisted_methods_still_pass_through() {
         })
         .to_string();
 
-        let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+        let result = evaluate_message(&interceptor, &msg).await.unwrap();
         assert!(
             matches!(result, EvaluateResult::Forward { .. }),
             "allowlisted method '{method}' must be forwarded without evaluation"
         );
     }
+}
+
+/// M1.3: Egress audit logging — every allowed tools/call that gets a server
+/// response should produce an egress log entry in the audit chain.
+#[tokio::test]
+async fn egress_response_is_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("egress_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let interceptor = Interceptor::new(engine.clone());
+
+    // 1. Send an allowed tools/call request
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 50,
+        "method": "tools/call",
+        "params": {
+            "name": "summarise_report",
+            "arguments": {"text": "quarterly earnings"}
+        }
+    })
+    .to_string();
+
+    let result = evaluate_message(&interceptor, &msg).await.unwrap();
+    assert!(matches!(result, EvaluateResult::Forward { .. }));
+
+    // 2. Simulate the server response and log it
+    let server_response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 50,
+        "result": {"content": [{"type": "text", "text": "Q3 earnings were strong."}]}
+    })
+    .to_string();
+
+    log_response(&interceptor, &server_response).await.unwrap();
+
+    // 3. Verify audit chain is intact
+    assert!(
+        AuditChain::verify(&log_path).await.unwrap(),
+        "audit chain must be valid after egress logging"
+    );
+
+    // 4. Read back as generic JSON values to check the mixed-type chain
+    let raw = tokio::fs::read_to_string(&log_path).await.unwrap();
+    let lines: Vec<&str> = raw.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "should have 1 decision + 1 egress entry");
+
+    // The second entry should be the egress log with a content_hash field
+    let egress: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert!(
+        egress.get("content_hash").is_some(),
+        "egress entry must contain content_hash"
+    );
+    assert_eq!(egress["size_bytes"], server_response.len());
+    assert_eq!(egress["request_id"], 50);
 }

@@ -89,7 +89,7 @@ impl Firewall {
     }
 
     /// Run the firewall: spawn the downstream server and proxy messages.
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&self) -> Result<()> {
         // Spawn the downstream MCP server
         let mut child = Command::new(&self.config.server_command)
             .args(&self.config.server_args)
@@ -140,6 +140,11 @@ impl Firewall {
         loop {
             // Check for server responses to forward
             while let Ok(server_line) = rx.try_recv() {
+                // Log the egress response to the audit chain (non-blocking to the response)
+                if let Err(e) = self.interceptor.log_egress(&server_line).await {
+                    warn!("failed to log egress response: {e}");
+                }
+
                 client_writer
                     .write_all(server_line.as_bytes())
                     .await
@@ -243,16 +248,12 @@ impl Firewall {
     pub fn interceptor(&self) -> &Interceptor {
         &self.interceptor
     }
-
-    pub fn interceptor_mut(&mut self) -> &mut Interceptor {
-        &mut self.interceptor
-    }
 }
 
 /// Process a single JSON-RPC line through an interceptor without stdio transport.
 /// Useful for embedding the firewall in custom transports (HTTP, SSE, WebSocket).
 pub async fn evaluate_message(
-    interceptor: &mut Interceptor,
+    interceptor: &Interceptor,
     message: &str,
 ) -> Result<EvaluateResult> {
     let request: JsonRpcRequest = serde_json::from_str(message)
@@ -288,4 +289,15 @@ pub enum EvaluateResult {
     Block {
         response_json: String,
     },
+}
+
+/// Log a server→client response to the interceptor's audit chain.
+///
+/// Companion to `evaluate_message` for embedded transports. Call this
+/// for every response the downstream server sends back.
+pub async fn log_response(
+    interceptor: &Interceptor,
+    response: &str,
+) -> Result<()> {
+    interceptor.log_egress(response).await
 }

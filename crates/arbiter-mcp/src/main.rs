@@ -109,6 +109,6 @@ async fn main() -> Result<()> {
         config.manifest_path, config.audit_path, config.server_command
     );
 
-    let mut firewall = Firewall::boot(config).await?;
+    let firewall = Firewall::boot(config).await?;
     firewall.run().await
 }

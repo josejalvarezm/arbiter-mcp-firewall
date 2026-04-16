@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tempfile = "3"
+futures = "0.3"
 
 [[bin]]
 name = "latency_bench"

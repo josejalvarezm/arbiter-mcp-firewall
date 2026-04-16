@@ -38,3 +38,15 @@ pub struct DecisionLogEntry {
     pub rationale: String,
     pub outcome: Option<TaskStatus>,
 }
+
+/// An egress (server→client) audit entry logged by the firewall.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EgressLogEntry {
+    pub timestamp: DateTime<Utc>,
+    /// SHA-256 hex digest of the raw response content.
+    pub content_hash: String,
+    /// JSON-RPC `id` from the response, if parseable.
+    pub request_id: Option<serde_json::Value>,
+    /// Byte length of the raw response.
+    pub size_bytes: usize,
+}

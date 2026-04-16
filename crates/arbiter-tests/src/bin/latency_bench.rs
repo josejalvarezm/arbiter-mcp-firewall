@@ -201,7 +201,7 @@ async fn main() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("bench_engine.jsonl");
         let manifest = make_manifest(bc);
-        let mut engine = Engine::boot_from_manifest(manifest, &log_path).await.unwrap();
+        let engine = Engine::boot_from_manifest(manifest, &log_path).await.unwrap();
 
         let task = benign_task();
         // Warmup
@@ -221,7 +221,7 @@ async fn main() {
         let dir2 = tempfile::tempdir().unwrap();
         let log_path2 = dir2.path().join("bench_engine_refuse.jsonl");
         let manifest2 = make_manifest(bc);
-        let mut engine2 = Engine::boot_from_manifest(manifest2, &log_path2).await.unwrap();
+        let engine2 = Engine::boot_from_manifest(manifest2, &log_path2).await.unwrap();
 
         let vtask = violating_task();
         for _ in 0..100 {
@@ -244,7 +244,7 @@ async fn main() {
         let log_path = dir.path().join("bench_mcp.jsonl");
         let manifest = make_manifest(10);
         let engine = Engine::boot_from_manifest(manifest, &log_path).await.unwrap();
-        let mut interceptor = arbiter_mcp::Interceptor::new(engine);
+        let interceptor = arbiter_mcp::Interceptor::new(engine);
 
         let allowed_req = serde_json::to_string(&serde_json::json!({
             "jsonrpc": "2.0",
@@ -283,7 +283,7 @@ async fn main() {
         let log_path2 = dir2.path().join("bench_mcp_refuse.jsonl");
         let manifest2 = make_manifest(10);
         let engine2 = Engine::boot_from_manifest(manifest2, &log_path2).await.unwrap();
-        let mut interceptor2 = arbiter_mcp::Interceptor::new(engine2);
+        let interceptor2 = arbiter_mcp::Interceptor::new(engine2);
 
         for _ in 0..100 {
             let _ = interceptor2.process_raw(&refused_req).await.unwrap();

@@ -14,9 +14,10 @@ pub mod firewall;
 
 use anyhow::{Context, Result};
 use arbiter_engine::{Engine, EvalResult};
-use arbiter_shared::task::Task;
+use arbiter_shared::task::{EgressLogEntry, Task};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::instrument;
 
 /// A JSON-RPC 2.0 request (simplified for MCP tool calls).
@@ -103,7 +104,7 @@ impl Interceptor {
     /// If the method is `tools/call`, extracts the tool call, evaluates policy,
     /// and returns allow/refuse. For other methods, returns allow (pass-through).
     #[instrument(skip(self, request_json))]
-    pub async fn process_raw(&mut self, request_json: &str) -> Result<InterceptResult> {
+    pub async fn process_raw(&self, request_json: &str) -> Result<InterceptResult> {
         let request: JsonRpcRequest =
             serde_json::from_str(request_json).context("parsing JSON-RPC request")?;
 
@@ -119,7 +120,7 @@ impl Interceptor {
     /// - **Everything else** (`resources/read`, `sampling/createMessage`,
     ///   `prompts/get`, etc.): the method name becomes the `task_type` and
     ///   the params become the payload — routed through full policy evaluation.
-    pub async fn process(&mut self, request: &JsonRpcRequest) -> Result<InterceptResult> {
+    pub async fn process(&self, request: &JsonRpcRequest) -> Result<InterceptResult> {
         // 1. Protocol-level methods: pass through without evaluation.
         if is_passthrough_method(&request.method) {
             let tool_call = ToolCall {
@@ -149,7 +150,7 @@ impl Interceptor {
 
     /// Evaluate a tool call against the policy engine and return allow/refuse.
     async fn evaluate_tool_call(
-        &mut self,
+        &self,
         tool_call: ToolCall,
         request: &JsonRpcRequest,
     ) -> Result<InterceptResult> {
@@ -198,8 +199,26 @@ impl Interceptor {
         &self.engine
     }
 
-    pub fn engine_mut(&mut self) -> &mut Engine {
-        &mut self.engine
+    /// Log a server→client response to the audit chain.
+    ///
+    /// Records a SHA-256 content hash, the JSON-RPC request ID (if present),
+    /// and the response size. Does not block or modify the response.
+    pub async fn log_egress(&self, raw_response: &str) -> Result<()> {
+        let content_hash = format!(
+            "{:x}",
+            Sha256::new().chain_update(raw_response.as_bytes()).finalize()
+        );
+        let request_id = serde_json::from_str::<serde_json::Value>(raw_response)
+            .ok()
+            .and_then(|v| v.get("id").cloned());
+
+        let entry = EgressLogEntry {
+            timestamp: Utc::now(),
+            content_hash,
+            request_id,
+            size_bytes: raw_response.len(),
+        };
+        self.engine.audit().await.append(&entry).await
     }
 }
 
@@ -278,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn allows_benign_tool_call() {
         let dir = tempfile::tempdir().unwrap();
-        let mut interceptor = test_interceptor(dir.path()).await;
+        let interceptor = test_interceptor(dir.path()).await;
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -297,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_credential_access() {
         let dir = tempfile::tempdir().unwrap();
-        let mut interceptor = test_interceptor(dir.path()).await;
+        let interceptor = test_interceptor(dir.path()).await;
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -323,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn passes_through_non_tool_methods() {
         let dir = tempfile::tempdir().unwrap();
-        let mut interceptor = test_interceptor(dir.path()).await;
+        let interceptor = test_interceptor(dir.path()).await;
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -339,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn audit_log_valid_after_intercept() {
         let dir = tempfile::tempdir().unwrap();
-        let mut interceptor = test_interceptor(dir.path()).await;
+        let interceptor = test_interceptor(dir.path()).await;
 
         // One allowed, one refused
         let allow_req = JsonRpcRequest {
