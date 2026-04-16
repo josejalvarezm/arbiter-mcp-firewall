@@ -68,6 +68,26 @@ pub enum InterceptResult {
     Refuse(JsonRpcResponse),
 }
 
+/// MCP methods that are allowed through without policy evaluation.
+/// These are protocol-level handshake and notification methods that
+/// carry no security-relevant payload.
+const PASSTHROUGH_METHODS: &[&str] = &[
+    "ping",
+    "initialize",
+    "initialized",
+    "notifications/initialized",
+    "notifications/cancelled",
+    "notifications/progress",
+    "notifications/roots/list_changed",
+];
+
+/// Check whether a method is on the passthrough allowlist.
+///
+/// Exact match against `PASSTHROUGH_METHODS`.
+fn is_passthrough_method(method: &str) -> bool {
+    PASSTHROUGH_METHODS.iter().any(|&m| m == method)
+}
+
 /// The MCP policy interceptor. Wraps an Arbiter engine.
 pub struct Interceptor {
     engine: Engine,
@@ -91,9 +111,17 @@ impl Interceptor {
     }
 
     /// Process a parsed JSON-RPC request.
+    ///
+    /// Method handling (default-deny):
+    /// - **Passthrough allowlist** (`ping`, `initialize`, `initialized`,
+    ///   `notifications/*`): forwarded without policy evaluation.
+    /// - **`tools/call`**: tool name + arguments are extracted and evaluated.
+    /// - **Everything else** (`resources/read`, `sampling/createMessage`,
+    ///   `prompts/get`, etc.): the method name becomes the `task_type` and
+    ///   the params become the payload — routed through full policy evaluation.
     pub async fn process(&mut self, request: &JsonRpcRequest) -> Result<InterceptResult> {
-        if request.method != "tools/call" {
-            // Pass through non-tool-call methods
+        // 1. Protocol-level methods: pass through without evaluation.
+        if is_passthrough_method(&request.method) {
             let tool_call = ToolCall {
                 name: request.method.clone(),
                 arguments: request.params.clone(),
@@ -104,8 +132,27 @@ impl Interceptor {
             });
         }
 
-        // Extract tool call from params
-        let tool_call = extract_tool_call(&request.params)?;
+        // 2. tools/call: extract tool name + arguments.
+        if request.method == "tools/call" {
+            let tool_call = extract_tool_call(&request.params)?;
+            return self.evaluate_tool_call(tool_call, request).await;
+        }
+
+        // 3. Default-deny: route all other methods through policy evaluation.
+        //    The method name becomes the task_type; params become the payload.
+        let tool_call = ToolCall {
+            name: request.method.clone(),
+            arguments: request.params.clone(),
+        };
+        self.evaluate_tool_call(tool_call, request).await
+    }
+
+    /// Evaluate a tool call against the policy engine and return allow/refuse.
+    async fn evaluate_tool_call(
+        &mut self,
+        tool_call: ToolCall,
+        request: &JsonRpcRequest,
+    ) -> Result<InterceptResult> {
 
         // Build a Task from the tool call
         let task = Task {

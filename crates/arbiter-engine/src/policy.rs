@@ -212,6 +212,14 @@ fn normalize_word(word: &str) -> String {
         .collect()
 }
 
+/// Maximum recursion depth for JSON payload keyword extraction.
+/// Payloads nested deeper than this are silently truncated.
+const MAX_PAYLOAD_DEPTH: usize = 10;
+
+/// Maximum number of keywords extracted from a single payload.
+/// Extraction stops once this limit is reached.
+const MAX_PAYLOAD_KEYWORDS: usize = 500;
+
 /// Extract lowercased, NFKC-normalized keywords from a task.
 fn extract_task_keywords(task: &Task) -> Vec<String> {
     let mut keywords = Vec::new();
@@ -223,17 +231,27 @@ fn extract_task_keywords(task: &Task) -> Vec<String> {
         }
     }
 
-    extract_payload_keywords(&task.payload, &mut keywords);
+    extract_payload_keywords(&task.payload, &mut keywords, 0);
 
     keywords.sort();
     keywords.dedup();
     keywords
 }
 
-fn extract_payload_keywords(value: &serde_json::Value, keywords: &mut Vec<String>) {
+fn extract_payload_keywords(
+    value: &serde_json::Value,
+    keywords: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth >= MAX_PAYLOAD_DEPTH || keywords.len() >= MAX_PAYLOAD_KEYWORDS {
+        return;
+    }
     match value {
         serde_json::Value::String(s) => {
             for word in s.split_whitespace() {
+                if keywords.len() >= MAX_PAYLOAD_KEYWORDS {
+                    return;
+                }
                 let clean = normalize_word(word);
                 if clean.len() > 2 {
                     keywords.push(clean);
@@ -242,12 +260,18 @@ fn extract_payload_keywords(value: &serde_json::Value, keywords: &mut Vec<String
         }
         serde_json::Value::Object(map) => {
             for v in map.values() {
-                extract_payload_keywords(v, keywords);
+                if keywords.len() >= MAX_PAYLOAD_KEYWORDS {
+                    return;
+                }
+                extract_payload_keywords(v, keywords, depth + 1);
             }
         }
         serde_json::Value::Array(arr) => {
             for v in arr {
-                extract_payload_keywords(v, keywords);
+                if keywords.len() >= MAX_PAYLOAD_KEYWORDS {
+                    return;
+                }
+                extract_payload_keywords(v, keywords, depth + 1);
             }
         }
         _ => {}
@@ -404,5 +428,47 @@ mod tests {
         );
         // "ｃｈａｒｉｔｙ" normalizes to "charity" via NFKC
         assert!(matches!(engine.evaluate(&task), PolicyVerdict::Refuse(_)));
+    }
+
+    // --- M0.2 acceptance tests: payload depth & keyword limits ---
+
+    #[test]
+    fn payload_depth_limit_prevents_deep_recursion() {
+        // Build a payload nested deeper than MAX_PAYLOAD_DEPTH (10).
+        // Place a trigger+subject keyword at depth 15 — it must NOT be extracted.
+        let mut deep: serde_json::Value = serde_json::json!("password credential");
+        for _ in 0..15 {
+            deep = serde_json::json!({ "nested": deep });
+        }
+
+        let engine = PolicyEngine::from_boundaries(vec![security_boundary()]);
+        let task = make_task("t-deep", "query", deep);
+        // The trigger "password" is buried at depth 15, past the limit.
+        // Only the task_type "query" is extracted (len 5, no trigger match).
+        assert!(
+            matches!(engine.evaluate(&task), PolicyVerdict::Allow),
+            "keywords buried past MAX_PAYLOAD_DEPTH must not be extracted"
+        );
+    }
+
+    #[test]
+    fn payload_keyword_limit_caps_extraction() {
+        // Build a payload with >500 unique words, placing the trigger keyword
+        // AFTER the 500th word so it is never reached.
+        let mut words: Vec<String> = (0..510)
+            .map(|i| format!("word{:04}", i))
+            .collect();
+        // Place the dangerous keyword well past the limit.
+        words.push("password".into());
+        words.push("credential".into());
+        let big_text = words.join(" ");
+
+        let engine = PolicyEngine::from_boundaries(vec![security_boundary()]);
+        let task = make_task("t-many", "query", serde_json::json!({"text": big_text}));
+        // "password" and "credential" are after position 500 — must not be extracted.
+        assert!(
+            matches!(engine.evaluate(&task), PolicyVerdict::Allow),
+            "keywords past MAX_PAYLOAD_KEYWORDS must not be extracted"
+        );
     }
 }

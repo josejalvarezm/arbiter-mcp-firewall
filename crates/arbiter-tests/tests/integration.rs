@@ -250,3 +250,141 @@ async fn firewall_evaluate_message_passthrough() {
         "non-tool-call methods should pass through"
     );
 }
+
+// --- M0.1 acceptance tests: default-deny for unknown MCP methods ---
+
+/// resources/read must be evaluated by policy, not passed through.
+/// With a boundary that triggers on "access" + "credentials", a resources/read
+/// that accesses credentials should be BLOCKED.
+#[tokio::test]
+async fn default_deny_resources_read_is_evaluated() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("dd_resources_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let mut interceptor = Interceptor::new(engine);
+
+    // resources/read with params containing boundary-triggering keywords.
+    // The method name "resources/read" normalises to "resourcesread" (no slash),
+    // but the URI string tokens must split into standalone trigger+subject words.
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "resources/read",
+        "params": {
+            "uri": "secrets-store",
+            "description": "access the credentials password vault"
+        }
+    })
+    .to_string();
+
+    let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+    match result {
+        EvaluateResult::Block { response_json } => {
+            let resp: serde_json::Value = serde_json::from_str(&response_json).unwrap();
+            assert!(resp.get("error").is_some(), "block response must have error field");
+        }
+        EvaluateResult::Forward { .. } => {
+            panic!("resources/read touching credentials must be blocked, not forwarded");
+        }
+    }
+}
+
+/// sampling/createMessage must be evaluated by policy, not passed through.
+#[tokio::test]
+async fn default_deny_sampling_is_evaluated() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("dd_sampling_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let mut interceptor = Interceptor::new(engine);
+
+    // sampling/createMessage with content referencing credentials
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 21,
+        "method": "sampling/createMessage",
+        "params": {
+            "messages": [{"role": "user", "content": "access the credentials and read the password"}],
+            "maxTokens": 1000
+        }
+    })
+    .to_string();
+
+    let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+    match result {
+        EvaluateResult::Block { response_json } => {
+            let resp: serde_json::Value = serde_json::from_str(&response_json).unwrap();
+            assert!(resp.get("error").is_some(), "block response must have error field");
+        }
+        EvaluateResult::Forward { .. } => {
+            panic!("sampling/createMessage with credential content must be blocked");
+        }
+    }
+}
+
+/// prompts/get must be evaluated by policy, not passed through.
+#[tokio::test]
+async fn default_deny_prompts_is_evaluated() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("dd_prompts_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let mut interceptor = Interceptor::new(engine);
+
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 22,
+        "method": "prompts/get",
+        "params": {
+            "name": "access read password credentials"
+        }
+    })
+    .to_string();
+
+    let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+    match result {
+        EvaluateResult::Block { response_json } => {
+            let resp: serde_json::Value = serde_json::from_str(&response_json).unwrap();
+            assert!(resp.get("error").is_some(), "block response must have error field");
+        }
+        EvaluateResult::Forward { .. } => {
+            panic!("prompts/get with credential content must be blocked");
+        }
+    }
+}
+
+/// Allowlisted protocol methods still pass through after M0.1.
+#[tokio::test]
+async fn allowlisted_methods_still_pass_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("dd_allowlist_audit.jsonl");
+
+    let engine = Engine::boot_from_manifest(test_manifest(), &log_path)
+        .await
+        .unwrap();
+    let mut interceptor = Interceptor::new(engine);
+
+    // Test each allowlisted method
+    for method in &["ping", "initialize", "initialized", "notifications/initialized"] {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": method,
+            "params": {}
+        })
+        .to_string();
+
+        let result = evaluate_message(&mut interceptor, &msg).await.unwrap();
+        assert!(
+            matches!(result, EvaluateResult::Forward { .. }),
+            "allowlisted method '{method}' must be forwarded without evaluation"
+        );
+    }
+}
